@@ -1,0 +1,20 @@
+{
+  "version": "2.0",
+  "created": "2025-11-21T10:17:00.615399",
+  "modified": "2025-11-21T10:17:00.615437",
+  "salt": "2kSm0SjGQvymbquRRbdtUA==",
+  "entries": {
+    "_sentinel": {
+      "nonce": "789aq1pyGGhM0ohr",
+      "ciphertext": "dZwUaLqxhh8Jj8bSsqoQk6Xt4yYtDYuM5qy600T2EYh9XWQtC9SBlEz2KY0ENv5Nhr4=",
+      "hmac": "b364635c086cbbf23ed7c8dbdb83e5010e6d930c252bf24bf8721fc4aa26e572"
+    }
+  },
+  "metadata": {
+    "vault_name": "test",
+    "key_derivation": "Argon2id",
+    "encryption": "AES-256-GCM",
+    "integrity_protection": "HMAC-SHA256"
+  },
+  "integrity_hash": "32a32c01f8bc2b02fbaa40e858ff69fc0320c37ac0fc308089a44b930b29ed63"
+}
