@@ -18,6 +18,7 @@ Every task, no exceptions:
 2. **IMPLEMENT SECOND.** Execute the plan exactly. No scope creep, no "while I'm here" detours.
 3. **VERIFY LAST.** Run tests, exercise the feature end-to-end, inspect actual output. Do not report "done" based on the code looking right.
 4. **FIX AND RE-VERIFY.** If verification fails, diagnose the root cause, fix it, and re-verify. Loop until clean. Never paper over a failing check.
+5. **PUSH.** After verify passes and the commit lands, run `git push origin main` so the work is visible at `https://github.com/DerekJAmmer/PasswordManager`. A phase is not done until it is on the remote. Never claim "phase complete" while commits sit only in the local repo.
 
 ## Task decomposition
 
