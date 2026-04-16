@@ -135,19 +135,24 @@ The Password Manager uses AES-256-GCM (Advanced Encryption Standard with Galois/
 
 ### Key Derivation
 
-Master passwords are converted to encryption keys using a two-tier key derivation approach:
+The master password is turned into a 256-bit encryption key using Argon2id. The fallback path is PBKDF2-HMAC-SHA256 and only runs when the `argon2-cffi` package cannot be imported.
 
-Primary Method: Argon2id
-- If available and functioning, the application attempts to use Argon2id for key derivation
-- Argon2id is a modern, memory-hard password hashing algorithm recommended by security experts
+Primary method: Argon2id (via `argon2-cffi`)
+- Variant: Argon2id (hybrid of Argon2i and Argon2d)
+- Time cost: 2
+- Memory cost: 19456 KiB (19 MiB)
+- Parallelism: 1
+- Output length: 32 bytes (256 bits)
+- Parameters follow the OWASP 2023 Password Storage Cheat Sheet recommendation for Argon2id.
 
-Fallback Method: PBKDF2-SHA256
-- If Argon2id is unavailable, the application falls back to PBKDF2 with SHA-256
-- Iterations: 100,000
-- Key Length: 256 bits
-- Salt Length: 128 bits (randomly generated per vault)
+Fallback method: PBKDF2-HMAC-SHA256
+- Iterations: 310,000 (OWASP 2023 minimum for SHA-256)
+- Output length: 32 bytes
+- Only used if `import argon2` fails at startup.
 
-Both methods ensure that even weak passwords are computationally difficult to crack through brute force attacks. The dual-approach provides flexibility while maintaining security standards.
+Each vault records the KDF it was created with inside `metadata.kdf` (name and parameters). Load-time key derivation reads that metadata and dispatches to the matching routine, so a vault made with Argon2id always re-derives with Argon2id even if the fallback path is later exercised elsewhere.
+
+Salt is 16 bytes, generated per vault from `secrets.token_bytes` which pulls from the OS CSPRNG.
 
 ### Authentication and Integrity
 
@@ -299,11 +304,9 @@ This dual-layer approach ensures:
 
 **Backup Formats**
 
-The application supports two backup formats:
-- Version 2.0: Legacy format with single-layer encryption (for backward compatibility)
-- Version 2.1: Current format with file-level password protection (recommended)
+Only one backup format is supported: version 3.1. The outer envelope is tagged `3.1` and wraps an inner `export_data` tagged `3.0`. Both layers carry their own KDF metadata so decryption uses the exact parameters from export, never a guess.
 
-All new backups are created in version 2.1 format. Old backups continue to work without changes.
+Older formats (1.0, 2.0, 2.1) are rejected on import with a clear error. There is no migration path because no real user data was created under the old formats.
 
 ### Import a Vault
 
@@ -329,12 +332,10 @@ python vault.py import backup.json
 **Import Process**
 
 When importing a backup:
-1. The backup file version is detected
-2. If version 2.1 (file-level protection): The file-level encryption is decrypted first
-   - Wrong password is immediately detected with an error message
-   - Backup structure cannot be examined without the correct password
-3. The content-level encryption is decrypted and HMAC verified
-4. All entries are validated and added to the vault
+1. The backup version is checked. Anything other than `3.1` is rejected.
+2. The KDF metadata on the outer envelope is used to derive the file-level key. The outer ciphertext is decrypted and HMAC verified. Wrong password fails here without exposing inner contents.
+3. The inner `export_data` is parsed. Its version must be `3.0`. Its own KDF metadata is used to derive the content-level key for per-entry decryption.
+4. Each entry is decrypted, HMAC verified, and added to the new vault under the new vault's master key.
 
 If any integrity check fails, the import is aborted and an error is reported.
 
@@ -481,12 +482,15 @@ Backups use a two-layer encryption approach:
 The application configuration is stored in `config.py`. Key settings include:
 
 **Encryption Parameters:**
-- KDF_N: 16384 (memory cost factor for Argon2id, if available)
-- KDF_R: 8 (block size for Argon2id, if available)
-- KDF_P: 1 (parallelization factor for Argon2id, if available)
-- SALT_LENGTH: 16 bytes (128 bits of random salt per vault)
-- NONCE_LENGTH: 12 bytes (96 bits of random nonce per entry)
-- KEY_LENGTH: 32 bytes (256-bit AES key)
+- ARGON2_TIME_COST: 2 (Argon2id iteration count)
+- ARGON2_MEMORY_COST: 19456 KiB / 19 MiB (Argon2id memory cost)
+- ARGON2_PARALLELISM: 1 (Argon2id lanes)
+- PBKDF2_ITERATIONS: 310000 (PBKDF2-HMAC-SHA256 fallback, OWASP 2023 minimum)
+- SALT_LENGTH: 16 bytes
+- NONCE_LENGTH: 12 bytes (GCM nonce)
+- KEY_LENGTH: 32 bytes (AES-256)
+- VAULT_FORMAT_VERSION: "3.0"
+- BACKUP_FORMAT_VERSION: "3.1"
 
 **Security Policies:**
 - MIN_PASSWORD_LENGTH: 12 characters minimum
@@ -526,10 +530,15 @@ Vault files are stored in JSON format with the following structure:
 
 ```
 {
-  "version": "2.0",
-  "created": "2025-11-19T12:34:56Z",
-  "modified": "2025-11-19T12:34:56Z",
+  "version": "3.0",
+  "created": "2026-04-16T12:34:56Z",
+  "modified": "2026-04-16T12:34:56Z",
   "salt": "base64_encoded_salt_value",
+  "validation_token": {
+    "nonce": "base64_encoded_nonce",
+    "ciphertext": "base64_encoded_encrypted_token",
+    "hmac": "base64_encoded_hmac_tag"
+  },
   "entries": {
     "entry_name": {
       "nonce": "base64_encoded_nonce",
@@ -539,7 +548,12 @@ Vault files are stored in JSON format with the following structure:
   },
   "metadata": {
     "vault_name": "default",
-    "key_derivation": "Argon2id",
+    "kdf": {
+      "name": "Argon2id",
+      "time_cost": 2,
+      "memory_cost": 19456,
+      "parallelism": 1
+    },
     "encryption": "AES-256-GCM",
     "integrity_protection": "HMAC-SHA256"
   },
@@ -548,16 +562,16 @@ Vault files are stored in JSON format with the following structure:
 ```
 
 **Field Descriptions:**
-- version: Vault format version (currently 2.0)
-- created: Timestamp when vault was created
-- modified: Timestamp of last modification
-- salt: Random value used in key derivation (unique per vault, base64 encoded)
-- entries: Dictionary of password entries
-- nonce: Random value used in encryption (unique per entry, base64 encoded)
-- ciphertext: Encrypted password entry data (base64 encoded)
-- hmac: HMAC-SHA256 authentication tag for entry integrity verification
-- metadata: Information about vault configuration and encryption methods
-- integrity_hash: Vault-level integrity hash for detecting tampering
+- version: Vault format version. Current is `3.0`. Earlier versions are rejected on load.
+- created, modified: ISO 8601 timestamps.
+- salt: 16-byte random value used by the KDF. Base64 encoded.
+- validation_token: A known plaintext encrypted with the derived master key. Used to detect a wrong master password at load time without touching user entries.
+- entries: Dictionary of encrypted password entries. Each entry has its own nonce, ciphertext, and HMAC-SHA256 tag computed over nonce + ciphertext.
+- metadata.kdf: The exact KDF parameters used for this vault. Either `{"name": "Argon2id", "time_cost", "memory_cost", "parallelism"}` or `{"name": "PBKDF2-HMAC-SHA256", "iterations"}`. This field is the source of truth at load time.
+- metadata.encryption, metadata.integrity_protection: Descriptive strings. The code does not read them for dispatch.
+- integrity_hash: SHA-256 over sorted `name:nonce:ciphertext` tuples of all entries. Detects add, delete, or reorder without touching ciphertext.
+
+Backup files follow the same entry layout but wrap it in an outer envelope tagged `3.1` with its own `file_salt`, `file_nonce`, `file_ciphertext`, `file_hmac`, and `kdf` field. The decrypted payload is an inner object tagged `3.0` that carries its own content-level salt, `_content_kdf`, and the encrypted entries dictionary.
 
 ### File Permissions
 

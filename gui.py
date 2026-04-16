@@ -711,10 +711,6 @@ class PasswordManagerGUI:
                     failed_reasons = []
 
                     for entry_name, entry_data in decrypted_entries.items():
-                        # Skip sentinel entry from imports
-                        if entry_name == "_sentinel":
-                            continue
-
                         try:
                             username = entry_data.get("username", "")
                             entry_password = entry_data.get("password", "")

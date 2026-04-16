@@ -6,12 +6,22 @@ import os
 from pathlib import Path
 
 # Encryption Parameters
-KDF_N = 2**14  # 16384 - Argon2id memory cost
-KDF_R = 8
-KDF_P = 1
 SALT_LENGTH = 16
 NONCE_LENGTH = 12
 KEY_LENGTH = 32  # 256-bit for AES-256
+
+# Argon2id defaults (OWASP 2023 recommended)
+ARGON2_TIME_COST = 2
+ARGON2_MEMORY_COST = 19456  # 19 MiB in KiB
+ARGON2_PARALLELISM = 1
+
+# PBKDF2 fallback iterations (OWASP 2023 minimum for SHA-256)
+PBKDF2_ITERATIONS = 310000
+
+# On-disk format versions
+VAULT_FORMAT_VERSION = "3.0"
+BACKUP_FORMAT_VERSION = "3.1"
+VALIDATION_TOKEN_PLAINTEXT = "password_manager:v3.0:valid"
 
 # Security Policies
 MIN_PASSWORD_LENGTH = 12

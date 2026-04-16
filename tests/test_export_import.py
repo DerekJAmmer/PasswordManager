@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-Export/import round-trip tests for the v2.1 dual-layer backup format.
+Export/import round-trip tests for the v3.1 dual-layer backup format.
 
-These confirm that a vault exported to a v2.1 backup can be decrypted
-back to plaintext entries matching the original. The architecture audit
-raised a concern that _validate_export_data only accepts versions 1.0
-and 2.0 while exports are labelled 2.1 at the outer envelope. The inner
-export_data dict is written with version 2.0, so the validator applies
-to the inner layer and passes. This test proves the behaviour.
+The outer envelope is tagged v3.1 and wraps an inner export_data tagged
+v3.0. Both layers carry their own KDF metadata so decryption never has
+to guess parameters. These tests confirm a fresh export can be imported
+and decrypted back to the original plaintext entries.
 """
 
 import json
@@ -74,6 +72,7 @@ class TestExportImportRoundTrip(unittest.TestCase):
             export_data["entries"],
             EXPORT_PW,
             export_data["_content_salt"],
+            export_data["_content_kdf"],
         )
 
         self.assertEqual(set(decrypted.keys()), set(self.entries.keys()))
@@ -83,18 +82,20 @@ class TestExportImportRoundTrip(unittest.TestCase):
             self.assertEqual(decrypted[name]["url"], expected["url"])
             self.assertEqual(decrypted[name]["notes"], expected["notes"])
 
-    def test_outer_envelope_has_version_2_1(self):
+    def test_outer_envelope_has_version_3_1(self):
         self.vault.export_vault(self.backup_path, EXPORT_PW)
         outer = json.loads(self.backup_path.read_text())
-        self.assertEqual(outer["version"], "2.1")
-        for field in ("file_nonce", "file_ciphertext", "file_salt"):
+        self.assertEqual(outer["version"], "3.1")
+        for field in ("file_nonce", "file_ciphertext", "file_salt", "kdf"):
             self.assertIn(field, outer)
 
-    def test_inner_export_data_has_version_2_0(self):
+    def test_inner_export_data_has_version_3_0(self):
         self.vault.export_vault(self.backup_path, EXPORT_PW)
         reader = VaultManager(self.vault_path)
         export_data = reader.import_vault(self.backup_path, EXPORT_PW)
-        self.assertEqual(export_data["version"], "2.0")
+        self.assertEqual(export_data["version"], "3.0")
+        self.assertIn("_content_kdf", export_data)
+        self.assertIn("_content_salt", export_data)
 
     def test_wrong_export_password_raises(self):
         self.vault.export_vault(self.backup_path, EXPORT_PW)
@@ -137,7 +138,10 @@ class TestExportImportRoundTrip(unittest.TestCase):
         reader = VaultManager(empty_path)
         export_data = reader.import_vault(empty_backup, EXPORT_PW)
         decrypted = reader.decrypt_backup_entries(
-            export_data["entries"], EXPORT_PW, export_data["_content_salt"]
+            export_data["entries"],
+            EXPORT_PW,
+            export_data["_content_salt"],
+            export_data["_content_kdf"],
         )
         self.assertEqual(decrypted, {})
 

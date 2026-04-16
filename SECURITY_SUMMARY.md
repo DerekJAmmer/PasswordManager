@@ -14,19 +14,23 @@ The application uses modern cryptographic algorithms for all password storage an
 
 **Key Derivation**
 
-The master password is converted into an encryption key using a two-tier approach:
+The master password is converted into a 256-bit encryption key using Argon2id through the `argon2-cffi` library. PBKDF2-HMAC-SHA256 is wired as a fallback and only runs if the Argon2 import fails at startup.
 
-- Primary method: Argon2id key derivation function (if available)
-  - Memory cost: 16,384 iterations (N parameter)
-  - Block size: 8 (R parameter)
-  - Parallelization: 1 (P parameter)
-  - This takes approximately 2 seconds per key derivation, intentionally slow to prevent brute force attacks
+- Primary method: Argon2id
+  - Variant: Argon2id
+  - Time cost: 2
+  - Memory cost: 19456 KiB (19 MiB)
+  - Parallelism: 1
+  - Output: 32 bytes
+  - Parameters match the OWASP 2023 recommendation for Argon2id.
 
-- Fallback method: PBKDF2-SHA256 (if Argon2id unavailable)
-  - 100,000 iterations
-  - Provides compatibility across different systems while maintaining security
+- Fallback method: PBKDF2-HMAC-SHA256
+  - Iterations: 310,000 (OWASP 2023 minimum for SHA-256)
+  - Output: 32 bytes
 
-Both methods use a unique 16-byte random salt per vault, ensuring attackers cannot use pre-computed rainbow tables.
+Each vault records which KDF it was created with, along with the exact parameters, in `metadata.kdf`. Load-time derivation reads that record and calls the matching function. This removes any guesswork at import or unlock time and makes future KDF changes possible without another format break.
+
+Salts are 16 bytes per vault and 16 bytes per backup layer. They come from the OS CSPRNG via Python's `secrets` module, which prevents pre-computed rainbow table attacks.
 
 **Encryption**
 
@@ -144,9 +148,9 @@ This vault integrity hash is stored in the vault file. On load, if the vault met
 
 This detects if entries have been added, deleted, or reordered.
 
-**Entry Filtering**
+**Validation Token**
 
-The vault includes an internal "_sentinel" entry used only for password validation. This entry is filtered out when listing entries, so users cannot accidentally interact with it. It ensures that password validation always occurs against actual encrypted data.
+Each vault stores a top-level `validation_token` field. This is a short known plaintext (`password_manager:v3.0:valid`) encrypted with the derived master key and protected by HMAC-SHA256. On load, the token is decrypted and compared against the expected plaintext. A wrong master password fails at this check before any user entry is touched. The token lives at the top level of the vault document, not inside `entries`, so entry iteration does not need special-case filtering.
 
 ### Anti-Brute Force Protection
 
@@ -222,11 +226,11 @@ Backups use a two-layer encryption scheme:
 
 **Key Derivation for Backups**
 
-Backup passwords undergo the same key derivation as vault passwords:
-- Primary: Argon2id with 16,384 iterations (2 second derivation time)
-- Fallback: PBKDF2-SHA256 with 100,000 iterations
-- Unique 16-byte salt per backup layer
-- Both layers use independent salts to prevent key reuse
+Backup passwords run through the same KDF pipeline as vault passwords:
+- Primary: Argon2id (time_cost 2, memory_cost 19456 KiB, parallelism 1)
+- Fallback: PBKDF2-HMAC-SHA256 at 310,000 iterations
+- Independent 16-byte salt for the outer (file) layer and the inner (content) layer
+- The KDF parameters used at export time are written into both the outer envelope and the inner `export_data`, so import always derives with the exact parameters used at export
 
 **Entry Re-encryption Process**
 
@@ -352,10 +356,9 @@ This two-layer approach ensures:
 
 **Backup Format Versions**
 
-- Version 2.0: Single-layer encryption (legacy backups, still supported)
-- Version 2.1: Two-layer encryption with file-level password protection (current standard)
+- Version 3.1 is the only accepted format. The outer envelope is tagged `3.1`, its inner `export_data` is tagged `3.0`.
 
-The import function automatically detects the backup version and applies the appropriate decryption process.
+Earlier formats (1.0, 2.0, 2.1) are rejected on import with a clear error. There was no real data under the old formats, so no migration path is provided.
 
 **Import Function**
 
@@ -530,9 +533,10 @@ The following parameters control the security behavior of the application. These
 
 | Parameter | Current Value | Purpose | Security Impact |
 |-----------|---|---|---|
-| KDF_N | 16384 | Memory cost for Argon2id | Higher = slower brute force, more memory usage |
-| KDF_R | 8 | Block size for Argon2id | Higher = slower key derivation |
-| KDF_P | 1 | Parallelization for Argon2id | Higher = more parallelism, less memory efficiency |
+| ARGON2_TIME_COST | 2 | Argon2id iteration count | Higher = slower brute force, more CPU per derivation |
+| ARGON2_MEMORY_COST | 19456 (KiB) | Argon2id memory cost (19 MiB) | Higher = harder to parallelize on GPUs/ASICs |
+| ARGON2_PARALLELISM | 1 | Argon2id lanes | Higher = more parallelism; keep at 1 for single-user desktop |
+| PBKDF2_ITERATIONS | 310000 | PBKDF2-HMAC-SHA256 fallback rounds | OWASP 2023 minimum for SHA-256 |
 | SALT_LENGTH | 16 bytes | Salt randomness | Larger = harder rainbow tables, not noticeable to user |
 | NONCE_LENGTH | 12 bytes | Nonce size for GCM | Larger = lower collision risk, current is standard |
 | KEY_LENGTH | 32 bytes | AES encryption key | 32 = AES-256, 16 = AES-128 (not used) |
@@ -560,7 +564,9 @@ The application has been tested with the following security test cases:
 - Verify same password and salt always produce same key
 - Verify different passwords produce different keys
 - Verify salt is randomly generated
-- Verify key derivation completes in expected time (~2 seconds)
+- Verify Argon2id is actually invoked when `argon2-cffi` is importable
+- Verify the PBKDF2 fallback runs when the Argon2 import is patched to fail
+- Verify a vault records its KDF parameters in `metadata.kdf` and re-uses them on load
 
 **Brute Force Protection Tests**
 - Verify failed attempts are counted

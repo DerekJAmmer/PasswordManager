@@ -17,10 +17,22 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.backends import default_backend
 
 from config import (
-    KDF_N, KDF_R, KDF_P, SALT_LENGTH, NONCE_LENGTH, KEY_LENGTH,
+    SALT_LENGTH, NONCE_LENGTH, KEY_LENGTH,
+    ARGON2_TIME_COST, ARGON2_MEMORY_COST, ARGON2_PARALLELISM,
+    PBKDF2_ITERATIONS, VAULT_FORMAT_VERSION, BACKUP_FORMAT_VERSION,
+    VALIDATION_TOKEN_PLAINTEXT,
     VAULT_DIR, VAULTS_CONFIG_FILE, MAX_UNLOCK_ATTEMPTS,
     UNLOCK_ATTEMPT_BACKOFF_BASE, AUTO_LOCK_TIMEOUT
 )
+
+try:
+    from argon2 import low_level as _argon2_low_level
+    from argon2 import Type as _Argon2Type
+    ARGON2_AVAILABLE = True
+except ImportError:
+    _argon2_low_level = None
+    _Argon2Type = None
+    ARGON2_AVAILABLE = False
 from exceptions import (
     VaultException, VaultNotLoadedError, VaultCorruptedError,
     InvalidMasterPasswordError, InvalidEntryError, WeakPasswordError,
@@ -36,8 +48,10 @@ from security import (
 
 class VaultManager:
     """
-    Manages encrypted password vault with AES-256-GCM encryption and PBKDF2 key derivation.
-    Provides security features including integrity verification, rate limiting, and audit logging.
+    Manages an encrypted password vault. AES-256-GCM for entry encryption.
+    Argon2id for key derivation, with a PBKDF2-HMAC-SHA256 fallback at 310k
+    iterations if argon2-cffi is not importable. Also provides integrity
+    verification, rate limiting, and audit logging.
     """
 
     SALT_LENGTH = SALT_LENGTH
@@ -65,42 +79,105 @@ class VaultManager:
         except Exception as e:
             print(f"Warning: Audit logging initialization failed: {e}")
 
-    def _derive_key_argon2id(self, password: str, salt: bytes) -> bytes:
-        """Derive encryption key using PBKDF2-SHA256"""
-        import hashlib
-        key = hashlib.pbkdf2_hmac(
-            'sha256',
-            password.encode(),
-            salt,
-            100000,
-            dklen=self.KEY_LENGTH
+    def _derive_key_argon2id(
+        self,
+        password: str,
+        salt: bytes,
+        time_cost: int = ARGON2_TIME_COST,
+        memory_cost: int = ARGON2_MEMORY_COST,
+        parallelism: int = ARGON2_PARALLELISM,
+    ) -> bytes:
+        """Derive encryption key using Argon2id."""
+        if not ARGON2_AVAILABLE:
+            raise EncryptionError("argon2-cffi is not available")
+        return _argon2_low_level.hash_secret_raw(
+            secret=password.encode("utf-8"),
+            salt=salt,
+            time_cost=time_cost,
+            memory_cost=memory_cost,
+            parallelism=parallelism,
+            hash_len=self.KEY_LENGTH,
+            type=_Argon2Type.ID,
         )
-        return key
 
-    def _derive_key_fallback(self, password: str, salt: bytes) -> bytes:
-        """Fallback key derivation using PBKDF2"""
-        import hashlib
-        key = hashlib.pbkdf2_hmac(
-            'sha256',
-            password.encode(),
+    def _derive_key_fallback(
+        self,
+        password: str,
+        salt: bytes,
+        iterations: int = PBKDF2_ITERATIONS,
+    ) -> bytes:
+        """Fallback key derivation using PBKDF2-HMAC-SHA256."""
+        return hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
             salt,
-            100000,
-            dklen=self.KEY_LENGTH
+            iterations,
+            dklen=self.KEY_LENGTH,
         )
-        return key
+
+    @staticmethod
+    def _build_default_kdf_metadata() -> Dict[str, Any]:
+        """Return the kdf metadata dict for a new vault."""
+        if ARGON2_AVAILABLE:
+            return {
+                "name": "Argon2id",
+                "time_cost": ARGON2_TIME_COST,
+                "memory_cost": ARGON2_MEMORY_COST,
+                "parallelism": ARGON2_PARALLELISM,
+                "hash_len": KEY_LENGTH,
+                "salt_length": SALT_LENGTH,
+            }
+        return {
+            "name": "PBKDF2-HMAC-SHA256",
+            "iterations": PBKDF2_ITERATIONS,
+            "hash_len": KEY_LENGTH,
+            "salt_length": SALT_LENGTH,
+        }
+
+    def _derive_key_from_metadata(
+        self, password: str, salt: bytes, kdf_meta: Dict[str, Any]
+    ) -> bytes:
+        """Derive a key using the KDF recorded in vault metadata."""
+        name = kdf_meta.get("name")
+        if name == "Argon2id":
+            return self._derive_key_argon2id(
+                password,
+                salt,
+                time_cost=kdf_meta.get("time_cost", ARGON2_TIME_COST),
+                memory_cost=kdf_meta.get("memory_cost", ARGON2_MEMORY_COST),
+                parallelism=kdf_meta.get("parallelism", ARGON2_PARALLELISM),
+            )
+        if name == "PBKDF2-HMAC-SHA256":
+            return self._derive_key_fallback(
+                password,
+                salt,
+                iterations=kdf_meta.get("iterations", PBKDF2_ITERATIONS),
+            )
+        raise VaultException(f"Unsupported KDF in vault metadata: {name!r}")
 
     def _derive_key(self, password: str, salt: bytes) -> bytes:
-        """Derive encryption key with fallback to PBKDF2"""
-        try:
-            return self._derive_key_argon2id(password, salt)
-        except Exception:
-            return self._derive_key_fallback(password, salt)
+        """Derive an encryption key using the best KDF available.
+
+        Used for fresh vaults and for backup file/content keys. Reading an
+        existing vault always goes through _derive_key_from_metadata so the
+        recorded params are honoured.
+        """
+        return self._derive_key_from_metadata(
+            password, salt, self._build_default_kdf_metadata()
+        )
 
     def _get_derived_key(self) -> bytes:
-        """Get encryption key from stored password and salt"""
+        """Derive the master key using this vault's recorded KDF metadata."""
         if not self.master_password or not self.master_password_salt:
             raise VaultException("Vault not loaded - no password available")
-        return self._derive_key(self.master_password, self.master_password_salt)
+        kdf_meta = (self.vault_data or {}).get("metadata", {}).get("kdf")
+        if not kdf_meta:
+            # Back-compat path for code that derives before vault_data is
+            # populated. Uses the default (Argon2id if available).
+            kdf_meta = self._build_default_kdf_metadata()
+        return self._derive_key_from_metadata(
+            self.master_password, self.master_password_salt, kdf_meta
+        )
 
     def _encrypt_data(self, plaintext: str, key: bytes) -> Tuple[str, str]:
         """Encrypt plaintext with AES-256-GCM, returns (nonce_b64, ciphertext_b64)"""
@@ -222,31 +299,32 @@ class VaultManager:
             set_secure_dir_permissions(self.vault_path.parent)
 
             salt = secrets.token_bytes(self.SALT_LENGTH)
-            key = self._derive_key(password, salt)
+            kdf_meta = self._build_default_kdf_metadata()
+            key = self._derive_key_from_metadata(password, salt, kdf_meta)
             self.master_password = password
             self.master_password_salt = salt
 
+            token_nonce, token_ciphertext = self._encrypt_data(
+                VALIDATION_TOKEN_PLAINTEXT, key
+            )
+
             self.vault_data = {
-                "version": "2.0",
+                "version": VAULT_FORMAT_VERSION,
                 "created": datetime.now().isoformat(),
                 "modified": datetime.now().isoformat(),
                 "salt": base64.b64encode(salt).decode(),
+                "validation_token": {
+                    "nonce": token_nonce,
+                    "ciphertext": token_ciphertext,
+                },
                 "entries": {},
                 "metadata": {
                     "vault_name": vault_name,
-                    "key_derivation": "Argon2id",
+                    "kdf": kdf_meta,
                     "encryption": "AES-256-GCM",
-                    "integrity_protection": "GCM-authenticated"
+                    "integrity_protection": "GCM-authenticated",
                 },
-                "integrity_hash": ""
-            }
-
-            sentinel_data = {"_sentinel": "validation_marker"}
-            sentinel_json = json.dumps(sentinel_data)
-            nonce, ciphertext = self._encrypt_data(sentinel_json, key)
-            self.vault_data["entries"]["_sentinel"] = {
-                "nonce": nonce,
-                "ciphertext": ciphertext
+                "integrity_hash": "",
             }
 
             zero_fill_buffer(bytearray(key))
@@ -280,50 +358,60 @@ class VaultManager:
             vault_json = self.vault_path.read_text()
             self.vault_data = json.loads(vault_json)
 
-            if self.vault_data.get("version", "1.0") not in ["1.0", "2.0"]:
-                raise VaultCorruptedError("Unsupported vault version")
+            version = self.vault_data.get("version", "1.0")
+            if version != VAULT_FORMAT_VERSION:
+                raise VaultException(
+                    f"Unsupported vault format '{version}'. This build "
+                    f"requires version {VAULT_FORMAT_VERSION}. Older vaults "
+                    "are not migrated automatically."
+                )
+
+            kdf_meta = self.vault_data.get("metadata", {}).get("kdf")
+            if not kdf_meta:
+                raise VaultCorruptedError("Vault metadata missing KDF specification")
+
+            token = self.vault_data.get("validation_token")
+            if not token or "nonce" not in token or "ciphertext" not in token:
+                raise VaultCorruptedError("Vault is missing its validation_token")
 
             salt = base64.b64decode(self.vault_data["salt"])
-            key = self._derive_key(password, salt)
+            key = self._derive_key_from_metadata(password, salt, kdf_meta)
             self.master_password = password
             self.master_password_salt = salt
 
-            if "integrity_hash" in self.vault_data and self.vault_data["integrity_hash"]:
-                self._verify_vault_integrity()
+            try:
+                plaintext = self._decrypt_data(token["nonce"], token["ciphertext"], key)
+            except Exception:
+                zero_fill_buffer(bytearray(key))
+                del key
+                self.master_password = None
+                self.master_password_salt = None
+                self.failed_unlock_attempts += 1
+                log_audit_event(
+                    "VAULT_UNLOCK_FAILED",
+                    f"Authentication failed (attempt {self.failed_unlock_attempts})",
+                    False,
+                )
+                raise InvalidMasterPasswordError("Wrong password or corrupted vault")
 
-            entries = list(self.vault_data.get("entries", {}).items())
-            if entries:
-                try:
-                    first_entry_name, first_entry = entries[0]
-                    nonce = first_entry.get("nonce", "")
-                    ciphertext = first_entry.get("ciphertext", "")
-                    self._decrypt_data(nonce, ciphertext, key)
-                except Exception as e:
-                    zero_fill_buffer(bytearray(key))
-                    del key
-                    self.failed_unlock_attempts += 1
-                    log_audit_event(
-                        "VAULT_UNLOCK_FAILED",
-                        f"Authentication failed (attempt {self.failed_unlock_attempts})",
-                        False
-                    )
-                    raise InvalidMasterPasswordError("Wrong password or corrupted vault")
-            else:
-                try:
-                    cipher = AESGCM(key)
-                except Exception as e:
-                    zero_fill_buffer(bytearray(key))
-                    del key
-                    self.failed_unlock_attempts += 1
-                    log_audit_event(
-                        "VAULT_UNLOCK_FAILED",
-                        f"Authentication failed (attempt {self.failed_unlock_attempts})",
-                        False
-                    )
-                    raise InvalidMasterPasswordError("Wrong password or corrupted vault")
+            if plaintext != VALIDATION_TOKEN_PLAINTEXT:
+                zero_fill_buffer(bytearray(key))
+                del key
+                self.master_password = None
+                self.master_password_salt = None
+                self.failed_unlock_attempts += 1
+                log_audit_event(
+                    "VAULT_UNLOCK_FAILED",
+                    "Validation token plaintext mismatch",
+                    False,
+                )
+                raise InvalidMasterPasswordError("Wrong password or corrupted vault")
 
             zero_fill_buffer(bytearray(key))
             del key
+
+            if self.vault_data.get("integrity_hash"):
+                self._verify_vault_integrity()
 
             self.loaded_at = datetime.now()
             self.last_activity = datetime.now()
@@ -337,6 +425,8 @@ class VaultManager:
             return True
 
         except (InvalidMasterPasswordError, VaultLockedError, BruteForceDetectedError):
+            raise
+        except VaultException:
             raise
         except Exception as e:
             log_audit_event("VAULT_LOAD_ERROR", str(e), False)
@@ -454,9 +544,6 @@ class VaultManager:
             if self.vault_data is None or self.master_password is None:
                 raise VaultNotLoadedError("Vault not loaded")
 
-            if name == "_sentinel":
-                raise InvalidEntryError(f"Entry '{name}' not found")
-
             if name not in self.vault_data["entries"]:
                 raise InvalidEntryError(f"Entry '{name}' not found")
 
@@ -490,8 +577,7 @@ class VaultManager:
                 raise VaultNotLoadedError("Vault not loaded")
 
             self.last_activity = datetime.now()
-            entries = [name for name in self.vault_data["entries"].keys() if name != "_sentinel"]
-            return sorted(entries)
+            return sorted(self.vault_data["entries"].keys())
 
         except Exception as e:
             log_audit_event("ENTRY_LIST_ERROR", str(e), False)
@@ -504,9 +590,6 @@ class VaultManager:
 
             if self.vault_data is None:
                 raise VaultNotLoadedError("Vault not loaded")
-
-            if name == "_sentinel":
-                raise InvalidEntryError(f"Cannot delete system entry '{name}'")
 
             if name not in self.vault_data["entries"]:
                 raise InvalidEntryError(f"Entry '{name}' not found")
@@ -563,7 +646,7 @@ class VaultManager:
             del key
 
     def export_vault(self, export_path: Path, export_password: str) -> bool:
-        """Export vault to encrypted backup with file-level password protection"""
+        """Export vault to an encrypted v3.1 dual-layer backup."""
         try:
             self._check_auto_lock()
 
@@ -574,60 +657,68 @@ class VaultManager:
             if not is_valid:
                 raise WeakPasswordError("Export password does not meet strength requirements")
 
-            content_salt = secrets.token_bytes(self.SALT_LENGTH)
-            content_key = self._derive_key(export_password, content_salt)
+            kdf_meta = self.vault_data["metadata"]["kdf"]
 
             user_entries_plaintext = {}
-            for entry_name, entry_nonce_ciphertext in self.vault_data["entries"].items():
-                if entry_name == "_sentinel":
-                    continue
-                try:
-                    entry_json = self._decrypt_data(
-                        entry_nonce_ciphertext["nonce"],
-                        entry_nonce_ciphertext["ciphertext"],
-                        self._get_derived_key()
-                    )
-                    entry_dict = json.loads(entry_json)
-                    user_entries_plaintext[entry_name] = entry_dict
-                except Exception as e:
-                    print(f"Warning: Could not export entry '{entry_name}': {e}")
-                    continue
+            master_key = self._get_derived_key()
+            try:
+                for entry_name, ec in self.vault_data["entries"].items():
+                    try:
+                        entry_json = self._decrypt_data(ec["nonce"], ec["ciphertext"], master_key)
+                        user_entries_plaintext[entry_name] = json.loads(entry_json)
+                    except Exception as e:
+                        print(f"Warning: Could not export entry '{entry_name}': {e}")
+                        continue
+            finally:
+                zero_fill_buffer(bytearray(master_key))
+                del master_key
 
-            export_data = {
-                "version": "2.0",
-                "exported": datetime.now().isoformat(),
-                "source": str(self.vault_path),
-                "entries": {},
-                "metadata": self.vault_data["metadata"]
-            }
-
-            for entry_name, entry_plaintext in user_entries_plaintext.items():
-                entry_json = json.dumps(entry_plaintext)
-                nonce, ciphertext = self._encrypt_data(entry_json, content_key)
-                export_data["entries"][entry_name] = {
-                    "nonce": nonce,
-                    "ciphertext": ciphertext
+            content_salt = secrets.token_bytes(self.SALT_LENGTH)
+            content_key = self._derive_key_from_metadata(export_password, content_salt, kdf_meta)
+            try:
+                export_data = {
+                    "version": VAULT_FORMAT_VERSION,
+                    "exported": datetime.now().isoformat(),
+                    "source": str(self.vault_path),
+                    "entries": {},
+                    "metadata": self.vault_data["metadata"],
                 }
 
-            export_json = json.dumps(export_data, indent=2)
-            content_nonce, content_ciphertext = self._encrypt_data(export_json, content_key)
+                for entry_name, entry_plaintext in user_entries_plaintext.items():
+                    entry_json = json.dumps(entry_plaintext)
+                    nonce, ciphertext = self._encrypt_data(entry_json, content_key)
+                    export_data["entries"][entry_name] = {
+                        "nonce": nonce,
+                        "ciphertext": ciphertext,
+                    }
+
+                export_json = json.dumps(export_data, indent=2)
+                content_nonce, content_ciphertext = self._encrypt_data(export_json, content_key)
+            finally:
+                zero_fill_buffer(bytearray(content_key))
+                del content_key
 
             inner_backup = {
                 "nonce": content_nonce,
                 "ciphertext": content_ciphertext,
-                "content_salt": base64.b64encode(content_salt).decode()
+                "content_salt": base64.b64encode(content_salt).decode(),
             }
 
             inner_json = json.dumps(inner_backup)
             file_salt = secrets.token_bytes(self.SALT_LENGTH)
-            file_key = self._derive_key(export_password, file_salt)
-            file_nonce, file_ciphertext = self._encrypt_data(inner_json, file_key)
+            file_key = self._derive_key_from_metadata(export_password, file_salt, kdf_meta)
+            try:
+                file_nonce, file_ciphertext = self._encrypt_data(inner_json, file_key)
+            finally:
+                zero_fill_buffer(bytearray(file_key))
+                del file_key
 
             outer_backup = {
-                "version": "2.1",
+                "version": BACKUP_FORMAT_VERSION,
+                "kdf": kdf_meta,
                 "file_nonce": file_nonce,
                 "file_ciphertext": file_ciphertext,
-                "file_salt": base64.b64encode(file_salt).decode()
+                "file_salt": base64.b64encode(file_salt).decode(),
             }
 
             export_path.parent.mkdir(parents=True, exist_ok=True)
@@ -643,7 +734,7 @@ class VaultManager:
             raise
 
     def _validate_export_data(self, export_data: Dict[str, Any]) -> bool:
-        """Validate exported backup data structure"""
+        """Validate the structure of a v3.0 inner export_data dict."""
         if not isinstance(export_data, dict):
             raise VaultException("Corrupted backup: export data is not a dictionary")
 
@@ -659,8 +750,11 @@ class VaultManager:
             raise VaultException("Corrupted backup: metadata must be a dictionary")
 
         version = export_data.get("version")
-        if not isinstance(version, str) or version not in ["1.0", "2.0"]:
-            raise VaultException(f"Corrupted backup: invalid version format {version}")
+        if version != VAULT_FORMAT_VERSION:
+            raise VaultException(
+                f"Corrupted backup: inner export_data version '{version}' "
+                f"is not supported (expected {VAULT_FORMAT_VERSION})"
+            )
 
         exported = export_data.get("exported")
         if not isinstance(exported, str):
@@ -674,7 +768,8 @@ class VaultManager:
         return True
 
     def import_vault(self, import_path: Path, import_password: str) -> Dict[str, Any]:
-        """Import backup with file-level password protection and GCM verification"""
+        """Import a v3.1 backup. Returns the inner export_data plus content-layer
+        metadata needed by decrypt_backup_entries."""
         try:
             if not import_path.exists():
                 raise VaultException(f"Import file not found: {import_path}")
@@ -682,117 +777,90 @@ class VaultManager:
             backup_json = import_path.read_text()
             backup = json.loads(backup_json)
 
-            version = backup.get("version", "2.0")
+            version = backup.get("version")
+            if version != BACKUP_FORMAT_VERSION:
+                raise VaultException(
+                    f"Unsupported backup format '{version}'. This build "
+                    f"requires version {BACKUP_FORMAT_VERSION}. Older backups "
+                    "are not migrated automatically."
+                )
 
-            if version == "2.1":
-                required_fields = ["file_nonce", "file_ciphertext", "file_salt"]
-                for field in required_fields:
-                    if field not in backup:
-                        raise VaultException(f"Corrupted backup: missing '{field}' field")
-                    if not backup[field]:
-                        raise VaultException(f"Corrupted backup: empty '{field}' field")
+            required_fields = ["kdf", "file_nonce", "file_ciphertext", "file_salt"]
+            for field in required_fields:
+                if field not in backup:
+                    raise VaultException(f"Corrupted backup: missing '{field}' field")
+                if not backup[field]:
+                    raise VaultException(f"Corrupted backup: empty '{field}' field")
 
-                file_nonce = backup.get("file_nonce", "")
-                file_ciphertext = backup.get("file_ciphertext", "")
+            kdf_meta = backup["kdf"]
+            if not isinstance(kdf_meta, dict) or "name" not in kdf_meta:
+                raise VaultException("Corrupted backup: 'kdf' is malformed")
 
+            try:
+                file_salt = base64.b64decode(backup["file_salt"])
+            except Exception as e:
+                raise VaultException(f"Corrupted backup: invalid file_salt encoding - {e}")
+
+            file_key = self._derive_key_from_metadata(import_password, file_salt, kdf_meta)
+            try:
                 try:
-                    file_salt = base64.b64decode(backup.get("file_salt", ""))
-                except Exception as e:
-                    raise VaultException(f"Corrupted backup: invalid file_salt encoding - {e}")
-
-                file_key = self._derive_key(import_password, file_salt)
-
-                try:
-                    inner_json = self._decrypt_data(file_nonce, file_ciphertext, file_key)
-                except VaultCorruptedError as e:
-                    log_audit_event("IMPORT_ERROR", f"Backup tampering detected at file level: {str(e)}", False)
-                    raise VaultException("BACKUP TAMPERING DETECTED: File has been modified. GCM authentication failed.")
+                    inner_json = self._decrypt_data(
+                        backup["file_nonce"], backup["file_ciphertext"], file_key
+                    )
+                except VaultCorruptedError:
+                    log_audit_event("IMPORT_ERROR", "Backup tampering detected at file level", False)
+                    raise VaultException(
+                        "BACKUP TAMPERING DETECTED: file layer failed GCM authentication"
+                    )
                 except EncryptionError as e:
                     log_audit_event("IMPORT_ERROR", f"File-level decryption error: {str(e)}", False)
-                    raise VaultException(f"Failed to decrypt backup file: {str(e)} - Wrong password or corrupted file")
-                except Exception as e:
-                    log_audit_event("IMPORT_ERROR", f"File-level decryption failed: {str(e)}", False)
-                    raise VaultException(f"Failed to decrypt backup: {str(e)}")
+                    raise VaultException(
+                        f"Failed to decrypt backup: wrong password or corrupted file"
+                    )
+            finally:
+                zero_fill_buffer(bytearray(file_key))
+                del file_key
 
+            try:
+                inner_backup = json.loads(inner_json)
+            except json.JSONDecodeError as e:
+                raise VaultException(f"Corrupted backup: inner JSON is invalid - {e}")
+
+            for field in ("nonce", "ciphertext", "content_salt"):
+                if field not in inner_backup or not inner_backup[field]:
+                    raise VaultException(f"Corrupted backup: missing content '{field}'")
+
+            try:
+                content_salt = base64.b64decode(inner_backup["content_salt"])
+            except Exception as e:
+                raise VaultException(f"Corrupted backup: invalid content_salt encoding - {e}")
+
+            content_key = self._derive_key_from_metadata(import_password, content_salt, kdf_meta)
+            try:
                 try:
-                    inner_backup = json.loads(inner_json)
-                except json.JSONDecodeError as e:
-                    raise VaultException(f"Corrupted backup: inner JSON is invalid - {e}")
-
-                required_content_fields = ["nonce", "ciphertext", "content_salt"]
-                for field in required_content_fields:
-                    if field not in inner_backup:
-                        raise VaultException(f"Corrupted backup: missing content '{field}' field")
-                    if not inner_backup[field]:
-                        raise VaultException(f"Corrupted backup: empty content '{field}' field")
-
-                content_nonce = inner_backup.get("nonce", "")
-                content_ciphertext = inner_backup.get("ciphertext", "")
-
-                try:
-                    content_salt = base64.b64decode(inner_backup.get("content_salt", ""))
-                except Exception as e:
-                    raise VaultException(f"Corrupted backup: invalid content_salt encoding - {e}")
-
-                content_key = self._derive_key(import_password, content_salt)
-
-                try:
-                    export_json = self._decrypt_data(content_nonce, content_ciphertext, content_key)
-                except VaultCorruptedError as e:
-                    log_audit_event("IMPORT_ERROR", f"Backup tampering detected at content level: {str(e)}", False)
-                    raise VaultException("BACKUP TAMPERING DETECTED: Content has been modified. GCM authentication failed.")
+                    export_json = self._decrypt_data(
+                        inner_backup["nonce"], inner_backup["ciphertext"], content_key
+                    )
+                except VaultCorruptedError:
+                    log_audit_event("IMPORT_ERROR", "Backup tampering detected at content level", False)
+                    raise VaultException(
+                        "BACKUP TAMPERING DETECTED: content layer failed GCM authentication"
+                    )
                 except EncryptionError as e:
                     log_audit_event("IMPORT_ERROR", f"Content-level decryption error: {str(e)}", False)
                     raise VaultException(f"Failed to decrypt backup content: {str(e)}")
-                except Exception as e:
-                    log_audit_event("IMPORT_ERROR", f"Content-level decryption failed: {str(e)}", False)
-                    raise VaultException(f"Content verification failed: {str(e)}")
+            finally:
+                zero_fill_buffer(bytearray(content_key))
+                del content_key
 
-                try:
-                    export_data = json.loads(export_json)
-                except json.JSONDecodeError as e:
-                    raise VaultException(f"Corrupted backup: export data JSON is invalid - {e}")
+            try:
+                export_data = json.loads(export_json)
+            except json.JSONDecodeError as e:
+                raise VaultException(f"Corrupted backup: export data JSON is invalid - {e}")
 
-                self._validate_export_data(export_data)
-                export_data["_content_salt"] = inner_backup.get("content_salt", "")
-
-            else:
-                required_fields = ["nonce", "ciphertext", "salt"]
-                for field in required_fields:
-                    if field not in backup:
-                        raise VaultException(f"Corrupted backup: missing '{field}' field")
-                    if not backup[field]:
-                        raise VaultException(f"Corrupted backup: empty '{field}' field")
-
-                nonce = backup.get("nonce", "")
-                ciphertext = backup.get("ciphertext", "")
-
-                try:
-                    salt = base64.b64decode(backup.get("salt", ""))
-                except Exception as e:
-                    raise VaultException(f"Corrupted backup: invalid salt encoding - {e}")
-
-                import_key = self._derive_key(import_password, salt)
-
-                try:
-                    export_json = self._decrypt_data(nonce, ciphertext, import_key)
-                except VaultCorruptedError as e:
-                    log_audit_event("IMPORT_ERROR", f"Backup tampering detected: {str(e)}", False)
-                    raise VaultException("BACKUP TAMPERING DETECTED: Backup file has been modified. GCM authentication failed.")
-                except EncryptionError as e:
-                    log_audit_event("IMPORT_ERROR", f"Decryption error: {str(e)}", False)
-                    raise VaultException(f"Failed to decrypt backup: {str(e)}")
-                except Exception as e:
-                    log_audit_event("IMPORT_ERROR", f"Backup import failed: {str(e)}", False)
-                    raise VaultException(f"Failed to import backup: {str(e)}")
-
-                try:
-                    export_data = json.loads(export_json)
-                except json.JSONDecodeError as e:
-                    raise VaultException(f"Corrupted backup: export data JSON is invalid - {e}")
-
-                self._validate_export_data(export_data)
-                export_data["_content_salt"] = backup.get("salt", "")
+            self._validate_export_data(export_data)
+            export_data["_content_salt"] = inner_backup["content_salt"]
+            export_data["_content_kdf"] = kdf_meta
 
             log_audit_event("VAULT_IMPORTED", f"Vault imported from {import_path}")
             return export_data
@@ -803,39 +871,51 @@ class VaultManager:
             log_audit_event("IMPORT_ERROR", f"Unexpected error during import: {str(e)}", False)
             raise VaultException(f"Import failed: {str(e)}")
 
-    def decrypt_backup_entries(self, backup_entries: Dict, import_password: str, content_salt_b64: str) -> Dict[str, Dict[str, str]]:
-        """Decrypt entries from imported backup using backup password"""
+    def decrypt_backup_entries(
+        self,
+        backup_entries: Dict,
+        import_password: str,
+        content_salt_b64: str,
+        kdf_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Dict[str, str]]:
+        """Decrypt entries from an imported backup using the backup password
+        and the recorded KDF metadata. If kdf_meta is omitted, defaults to the
+        build's default KDF for forward compatibility."""
         try:
             content_salt = base64.b64decode(content_salt_b64)
-            content_key = self._derive_key(import_password, content_salt)
+            if kdf_meta is None:
+                kdf_meta = self._build_default_kdf_metadata()
+            content_key = self._derive_key_from_metadata(
+                import_password, content_salt, kdf_meta
+            )
 
             decrypted_entries = {}
+            try:
+                for entry_name, entry_data in backup_entries.items():
+                    try:
+                        nonce_b64 = entry_data.get("nonce", "")
+                        ciphertext_b64 = entry_data.get("ciphertext", "")
 
-            for entry_name, entry_data in backup_entries.items():
-                if entry_name == "_sentinel":
-                    continue
+                        if not nonce_b64 or not ciphertext_b64:
+                            continue
 
-                try:
-                    nonce_b64 = entry_data.get("nonce", "")
-                    ciphertext_b64 = entry_data.get("ciphertext", "")
+                        entry_json = self._decrypt_data(nonce_b64, ciphertext_b64, content_key)
+                        entry_dict = json.loads(entry_json)
 
-                    if not nonce_b64 or not ciphertext_b64:
+                        decrypted_entries[entry_name] = {
+                            "username": entry_dict.get("username", ""),
+                            "password": entry_dict.get("password", ""),
+                            "url": entry_dict.get("url", ""),
+                            "notes": entry_dict.get("notes", ""),
+                        }
+                    except Exception as e:
+                        print(f"Failed to decrypt entry '{entry_name}': {e}")
                         continue
 
-                    entry_json = self._decrypt_data(nonce_b64, ciphertext_b64, content_key)
-                    entry_dict = json.loads(entry_json)
-
-                    decrypted_entries[entry_name] = {
-                        "username": entry_dict.get("username", ""),
-                        "password": entry_dict.get("password", ""),
-                        "url": entry_dict.get("url", ""),
-                        "notes": entry_dict.get("notes", ""),
-                    }
-                except Exception as e:
-                    print(f"Failed to decrypt entry '{entry_name}': {e}")
-                    continue
-
-            return decrypted_entries
+                return decrypted_entries
+            finally:
+                zero_fill_buffer(bytearray(content_key))
+                del content_key
 
         except Exception as e:
             raise VaultException(f"Failed to decrypt backup entries: {e}")

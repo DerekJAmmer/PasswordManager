@@ -256,13 +256,14 @@ class TestVaultExport(VaultTestBase):
         self.assertTrue(self.vault.export_vault(self.export_path, EXPORT_PW))
         self.assertTrue(self.export_path.exists())
 
-    def test_export_is_valid_v21_envelope(self):
+    def test_export_is_valid_v31_envelope(self):
         self.vault.export_vault(self.export_path, EXPORT_PW)
         data = json.loads(self.export_path.read_text())
-        self.assertEqual(data["version"], "2.1")
+        self.assertEqual(data["version"], "3.1")
         self.assertIn("file_nonce", data)
         self.assertIn("file_ciphertext", data)
         self.assertIn("file_salt", data)
+        self.assertIn("kdf", data)
 
     def test_export_hides_plaintext_identifiers(self):
         self.vault.export_vault(self.export_path, EXPORT_PW)
