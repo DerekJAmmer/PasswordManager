@@ -14,6 +14,10 @@ env/
 
 # Claude Code local config
 .claude/
+CLAUDE.md
+
+# Tests are local-only. Not published.
+tests/
 
 # Test artifacts
 test_*_temp.json
