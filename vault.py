@@ -200,7 +200,10 @@ class VaultManager:
 
         inactivity = datetime.now() - self.last_activity
         if inactivity.total_seconds() > AUTO_LOCK_TIMEOUT:
-            self.master_key = None
+            if self.master_password:
+                zero_fill_buffer(bytearray(self.master_password.encode()))
+            self.master_password = None
+            self.master_password_salt = None
             self.is_locked = True
             log_audit_event("AUTO_LOCK", f"Vault auto-locked after {AUTO_LOCK_TIMEOUT}s inactivity")
             raise VaultLockedError("Vault auto-locked due to inactivity")
