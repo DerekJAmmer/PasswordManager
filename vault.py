@@ -40,8 +40,10 @@ from exceptions import (
 )
 from security import (
     set_secure_permissions, set_secure_dir_permissions, set_readonly_permissions,
+    set_vault_file_permissions, make_vault_writable,
     validate_password_strength, compute_hmac, verify_hmac,
-    zero_fill_buffer, secure_random_bytes, log_audit_event,
+    zero_fill_buffer, wipe_key, try_lock_memory,
+    secure_random_bytes, log_audit_event,
     setup_audit_logging, secure_derive_key
 )
 
@@ -73,6 +75,9 @@ class VaultManager:
         self.last_activity: Optional[datetime] = None
         self.failed_unlock_attempts = 0
         self.is_locked = False
+        # Plaintext of the encrypted_metadata block (validation_token + timestamps).
+        # Populated at init_vault / load_vault time, re-encrypted on each write.
+        self._meta_plaintext: Optional[Dict[str, str]] = None
 
         try:
             setup_audit_logging()
@@ -86,11 +91,11 @@ class VaultManager:
         time_cost: int = ARGON2_TIME_COST,
         memory_cost: int = ARGON2_MEMORY_COST,
         parallelism: int = ARGON2_PARALLELISM,
-    ) -> bytes:
-        """Derive encryption key using Argon2id."""
+    ) -> bytearray:
+        """Derive encryption key using Argon2id. Returns a locked bytearray."""
         if not ARGON2_AVAILABLE:
             raise EncryptionError("argon2-cffi is not available")
-        return _argon2_low_level.hash_secret_raw(
+        raw = _argon2_low_level.hash_secret_raw(
             secret=password.encode("utf-8"),
             salt=salt,
             time_cost=time_cost,
@@ -99,21 +104,27 @@ class VaultManager:
             hash_len=self.KEY_LENGTH,
             type=_Argon2Type.ID,
         )
+        buf = bytearray(raw)
+        try_lock_memory(buf)
+        return buf
 
     def _derive_key_fallback(
         self,
         password: str,
         salt: bytes,
         iterations: int = PBKDF2_ITERATIONS,
-    ) -> bytes:
-        """Fallback key derivation using PBKDF2-HMAC-SHA256."""
-        return hashlib.pbkdf2_hmac(
+    ) -> bytearray:
+        """PBKDF2-HMAC-SHA256 fallback. Returns a locked bytearray."""
+        raw = hashlib.pbkdf2_hmac(
             "sha256",
             password.encode("utf-8"),
             salt,
             iterations,
             dklen=self.KEY_LENGTH,
         )
+        buf = bytearray(raw)
+        try_lock_memory(buf)
+        return buf
 
     @staticmethod
     def _build_default_kdf_metadata() -> Dict[str, Any]:
@@ -136,7 +147,7 @@ class VaultManager:
 
     def _derive_key_from_metadata(
         self, password: str, salt: bytes, kdf_meta: Dict[str, Any]
-    ) -> bytes:
+    ) -> bytearray:
         """Derive a key using the KDF recorded in vault metadata."""
         name = kdf_meta.get("name")
         if name == "Argon2id":
@@ -155,7 +166,7 @@ class VaultManager:
             )
         raise VaultException(f"Unsupported KDF in vault metadata: {name!r}")
 
-    def _derive_key(self, password: str, salt: bytes) -> bytes:
+    def _derive_key(self, password: str, salt: bytes) -> bytearray:
         """Derive an encryption key using the best KDF available.
 
         Used for fresh vaults and for backup file/content keys. Reading an
@@ -166,8 +177,12 @@ class VaultManager:
             password, salt, self._build_default_kdf_metadata()
         )
 
-    def _get_derived_key(self) -> bytes:
-        """Derive the master key using this vault's recorded KDF metadata."""
+    def _get_derived_key(self) -> bytearray:
+        """Derive the master key using this vault's recorded KDF metadata.
+
+        Returns a locked bytearray. The caller MUST invoke `wipe_key(buf)` in
+        a `finally` block to zero and unlock the memory.
+        """
         if not self.master_password or not self.master_password_salt:
             raise VaultException("Vault not loaded - no password available")
         kdf_meta = (self.vault_data or {}).get("metadata", {}).get("kdf")
@@ -179,11 +194,14 @@ class VaultManager:
             self.master_password, self.master_password_salt, kdf_meta
         )
 
-    def _encrypt_data(self, plaintext: str, key: bytes) -> Tuple[str, str]:
-        """Encrypt plaintext with AES-256-GCM, returns (nonce_b64, ciphertext_b64)"""
+    def _encrypt_data(self, plaintext: str, key) -> Tuple[str, str]:
+        """Encrypt plaintext with AES-256-GCM, returns (nonce_b64, ciphertext_b64).
+
+        `key` may be bytes or bytearray; AESGCM accepts both via buffer protocol.
+        """
         try:
             nonce = secrets.token_bytes(self.NONCE_LENGTH)
-            cipher = AESGCM(key)
+            cipher = AESGCM(key if isinstance(key, (bytes, bytearray)) else bytes(key))
             ciphertext = cipher.encrypt(nonce, plaintext.encode(), None)
             return (
                 base64.b64encode(nonce).decode(),
@@ -192,12 +210,12 @@ class VaultManager:
         except Exception as e:
             raise EncryptionError(f"Encryption failed: {e}")
 
-    def _decrypt_data(self, nonce_b64: str, ciphertext_b64: str, key: bytes) -> str:
-        """Decrypt base64-encoded (nonce, ciphertext) with GCM authentication"""
+    def _decrypt_data(self, nonce_b64: str, ciphertext_b64: str, key) -> str:
+        """Decrypt base64-encoded (nonce, ciphertext) with GCM authentication."""
         try:
             nonce = base64.b64decode(nonce_b64)
             ciphertext = base64.b64decode(ciphertext_b64)
-            cipher = AESGCM(key)
+            cipher = AESGCM(key if isinstance(key, (bytes, bytearray)) else bytes(key))
             plaintext = cipher.decrypt(nonce, ciphertext, None)
             return plaintext.decode()
         except Exception as e:
@@ -281,9 +299,46 @@ class VaultManager:
                 zero_fill_buffer(bytearray(self.master_password.encode()))
             self.master_password = None
             self.master_password_salt = None
+            self.vault_data = None
+            self._meta_plaintext = None
             self.is_locked = True
             log_audit_event("AUTO_LOCK", f"Vault auto-locked after {AUTO_LOCK_TIMEOUT}s inactivity")
             raise VaultLockedError("Vault auto-locked due to inactivity")
+
+    def _refresh_encrypted_metadata(self) -> None:
+        """Re-encrypt the metadata block (validation_token + timestamps).
+
+        Bumps `modified` to now and re-encrypts with a fresh nonce. The
+        ciphertext goes into `vault_data["encrypted_metadata"]`. Preserves
+        `created` from the instance's current plaintext.
+        """
+        if self._meta_plaintext is None:
+            raise VaultException("Encrypted metadata not initialized")
+        self._meta_plaintext["modified"] = datetime.now().isoformat()
+        meta_json = json.dumps(self._meta_plaintext, sort_keys=True)
+
+        key = self._get_derived_key()
+        try:
+            nonce, ciphertext = self._encrypt_data(meta_json, key)
+        finally:
+            wipe_key(key)
+
+        self.vault_data["encrypted_metadata"] = {
+            "nonce": nonce,
+            "ciphertext": ciphertext,
+        }
+
+    def _persist_vault(self) -> None:
+        """Write vault_data to disk with secure permissions.
+
+        Relaxes the on-disk perms to owner-rw just long enough to rewrite
+        the file, then restores owner-read-only. New files go straight to
+        owner-read-only. Callers must have already refreshed the encrypted
+        metadata and integrity hash.
+        """
+        make_vault_writable(self.vault_path)
+        self.vault_path.write_text(json.dumps(self.vault_data, indent=2))
+        set_vault_file_permissions(self.vault_path)
 
     def init_vault(self, password: str, vault_name: str = "default") -> bool:
         """Initialize new vault with master password"""
@@ -300,23 +355,20 @@ class VaultManager:
 
             salt = secrets.token_bytes(self.SALT_LENGTH)
             kdf_meta = self._build_default_kdf_metadata()
-            key = self._derive_key_from_metadata(password, salt, kdf_meta)
             self.master_password = password
             self.master_password_salt = salt
 
-            token_nonce, token_ciphertext = self._encrypt_data(
-                VALIDATION_TOKEN_PLAINTEXT, key
-            )
+            now_iso = datetime.now().isoformat()
+            self._meta_plaintext = {
+                "validation_token": VALIDATION_TOKEN_PLAINTEXT,
+                "created": now_iso,
+                "modified": now_iso,
+            }
 
             self.vault_data = {
                 "version": VAULT_FORMAT_VERSION,
-                "created": datetime.now().isoformat(),
-                "modified": datetime.now().isoformat(),
                 "salt": base64.b64encode(salt).decode(),
-                "validation_token": {
-                    "nonce": token_nonce,
-                    "ciphertext": token_ciphertext,
-                },
+                "encrypted_metadata": {},
                 "entries": {},
                 "metadata": {
                     "vault_name": vault_name,
@@ -327,12 +379,10 @@ class VaultManager:
                 "integrity_hash": "",
             }
 
-            zero_fill_buffer(bytearray(key))
-            del key
-
+            # Encrypts using _get_derived_key, which reads vault_data.metadata.kdf.
+            self._refresh_encrypted_metadata()
             self.vault_data["integrity_hash"] = self._compute_vault_integrity_hash()
-            self.vault_path.write_text(json.dumps(self.vault_data, indent=2))
-            set_secure_permissions(self.vault_path)
+            self._persist_vault()
 
             log_audit_event(
                 "VAULT_CREATED",
@@ -370,9 +420,9 @@ class VaultManager:
             if not kdf_meta:
                 raise VaultCorruptedError("Vault metadata missing KDF specification")
 
-            token = self.vault_data.get("validation_token")
-            if not token or "nonce" not in token or "ciphertext" not in token:
-                raise VaultCorruptedError("Vault is missing its validation_token")
+            enc_meta = self.vault_data.get("encrypted_metadata")
+            if not enc_meta or "nonce" not in enc_meta or "ciphertext" not in enc_meta:
+                raise VaultCorruptedError("Vault is missing its encrypted_metadata block")
 
             salt = base64.b64decode(self.vault_data["salt"])
             key = self._derive_key_from_metadata(password, salt, kdf_meta)
@@ -380,35 +430,44 @@ class VaultManager:
             self.master_password_salt = salt
 
             try:
-                plaintext = self._decrypt_data(token["nonce"], token["ciphertext"], key)
-            except Exception:
-                zero_fill_buffer(bytearray(key))
-                del key
-                self.master_password = None
-                self.master_password_salt = None
-                self.failed_unlock_attempts += 1
-                log_audit_event(
-                    "VAULT_UNLOCK_FAILED",
-                    f"Authentication failed (attempt {self.failed_unlock_attempts})",
-                    False,
-                )
-                raise InvalidMasterPasswordError("Wrong password or corrupted vault")
+                try:
+                    meta_json = self._decrypt_data(
+                        enc_meta["nonce"], enc_meta["ciphertext"], key
+                    )
+                except Exception:
+                    self.master_password = None
+                    self.master_password_salt = None
+                    self.failed_unlock_attempts += 1
+                    log_audit_event(
+                        "VAULT_UNLOCK_FAILED",
+                        f"Authentication failed (attempt {self.failed_unlock_attempts})",
+                        False,
+                    )
+                    raise InvalidMasterPasswordError("Wrong password or corrupted vault")
 
-            if plaintext != VALIDATION_TOKEN_PLAINTEXT:
-                zero_fill_buffer(bytearray(key))
-                del key
-                self.master_password = None
-                self.master_password_salt = None
-                self.failed_unlock_attempts += 1
-                log_audit_event(
-                    "VAULT_UNLOCK_FAILED",
-                    "Validation token plaintext mismatch",
-                    False,
-                )
-                raise InvalidMasterPasswordError("Wrong password or corrupted vault")
+                try:
+                    meta_plaintext = json.loads(meta_json)
+                except json.JSONDecodeError:
+                    raise VaultCorruptedError("Encrypted metadata is not valid JSON")
 
-            zero_fill_buffer(bytearray(key))
-            del key
+                if meta_plaintext.get("validation_token") != VALIDATION_TOKEN_PLAINTEXT:
+                    self.master_password = None
+                    self.master_password_salt = None
+                    self.failed_unlock_attempts += 1
+                    log_audit_event(
+                        "VAULT_UNLOCK_FAILED",
+                        "Validation token plaintext mismatch",
+                        False,
+                    )
+                    raise InvalidMasterPasswordError("Wrong password or corrupted vault")
+
+                self._meta_plaintext = {
+                    "validation_token": meta_plaintext["validation_token"],
+                    "created": meta_plaintext.get("created", ""),
+                    "modified": meta_plaintext.get("modified", ""),
+                }
+            finally:
+                wipe_key(key)
 
             if self.vault_data.get("integrity_hash"):
                 self._verify_vault_integrity()
@@ -467,17 +526,15 @@ class VaultManager:
                     "ciphertext": ciphertext
                 }
 
-                self.vault_data["modified"] = datetime.now().isoformat()
+                self._refresh_encrypted_metadata()
                 self.vault_data["integrity_hash"] = self._compute_vault_integrity_hash()
-                self.vault_path.write_text(json.dumps(self.vault_data, indent=2))
-                set_secure_permissions(self.vault_path)
+                self._persist_vault()
 
                 self.last_activity = datetime.now()
                 log_audit_event("ENTRY_IMPORTED", f"Entry imported: {name}")
                 return True
             finally:
-                zero_fill_buffer(bytearray(key))
-                del key
+                wipe_key(key)
 
         except Exception as e:
             log_audit_event("ENTRY_IMPORT_ERROR", str(e), False)
@@ -520,17 +577,15 @@ class VaultManager:
                     "ciphertext": ciphertext
                 }
 
-                self.vault_data["modified"] = datetime.now().isoformat()
+                self._refresh_encrypted_metadata()
                 self.vault_data["integrity_hash"] = self._compute_vault_integrity_hash()
-                self.vault_path.write_text(json.dumps(self.vault_data, indent=2))
-                set_secure_permissions(self.vault_path)
+                self._persist_vault()
 
                 self.last_activity = datetime.now()
                 log_audit_event("ENTRY_ADDED", f"New entry added: {name}")
                 return True
             finally:
-                zero_fill_buffer(bytearray(key))
-                del key
+                wipe_key(key)
 
         except Exception as e:
             log_audit_event("ENTRY_ADD_ERROR", str(e), False)
@@ -561,8 +616,7 @@ class VaultManager:
                 log_audit_event("ENTRY_ACCESSED", f"Entry retrieved: {name}")
                 return json.loads(entry_json)
             finally:
-                zero_fill_buffer(bytearray(key))
-                del key
+                wipe_key(key)
 
         except Exception as e:
             log_audit_event("ENTRY_ACCESS_ERROR", str(e), False)
@@ -596,11 +650,9 @@ class VaultManager:
 
             del self.vault_data["entries"][name]
 
-            self.vault_data["modified"] = datetime.now().isoformat()
+            self._refresh_encrypted_metadata()
             self.vault_data["integrity_hash"] = self._compute_vault_integrity_hash()
-
-            self.vault_path.write_text(json.dumps(self.vault_data, indent=2))
-            set_secure_permissions(self.vault_path)
+            self._persist_vault()
 
             self.last_activity = datetime.now()
             log_audit_event("ENTRY_DELETED", f"Entry deleted: {name}")
@@ -722,6 +774,7 @@ class VaultManager:
             }
 
             export_path.parent.mkdir(parents=True, exist_ok=True)
+            make_vault_writable(export_path)
             export_path.write_text(json.dumps(outer_backup, indent=2))
             set_readonly_permissions(export_path)
 
@@ -921,11 +974,13 @@ class VaultManager:
             raise VaultException(f"Failed to decrypt backup entries: {e}")
 
     def lock_vault(self):
-        """Manually lock vault"""
+        """Manually lock vault and drop all in-memory secrets."""
         if self.master_password:
             zero_fill_buffer(bytearray(self.master_password.encode()))
             self.master_password = None
         self.master_password_salt = None
+        self.vault_data = None
+        self._meta_plaintext = None
         self.is_locked = True
         log_audit_event("VAULT_LOCKED", "Vault manually locked")
 
@@ -936,6 +991,7 @@ class VaultManager:
             self.master_password = None
         self.master_password_salt = None
         self.vault_data = None
+        self._meta_plaintext = None
         self.is_locked = True
 
 

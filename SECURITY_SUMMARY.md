@@ -66,21 +66,21 @@ The vault file and related configuration files are protected at the operating sy
 
 **Windows ACL Enforcement**
 
-On Windows systems, vault files are protected using NTFS Access Control Lists:
-- Owner: Full control (read, write, delete)
-- Administrators: Inherits from owner
-- All other users: No access
-- Inheritance: Explicitly disabled to prevent inherited permissions
+On Windows systems, vault files and backup files are protected using NTFS Access Control Lists:
+- Vault and backup files: owner R-only, Administrators R-only, inheritance disabled
+- Vault directory: owner Full control, Administrators Full control, inheritance disabled
+- All other users: no access
 
-These permissions are set using icacls during vault creation and on every vault save operation.
+The icacls invocation is a list-form `subprocess.run(..., shell=False)` call (no string interpolation), which closes the classic icacls command-injection path. Each on-disk rewrite relaxes the ACL to R,W just long enough to call `write_text`, then restores the R-only ACL.
 
 **Unix Permissions Enforcement**
 
 On Unix-like systems (Linux, macOS):
-- Vault files: 0o600 (read/write for owner only, no group or other access)
-- Vault directory: 0o700 (read/write/execute for owner only)
+- Vault and backup files at rest: `0o400` (owner read-only)
+- Vault directory: `0o700`
+- Audit log: `0o600` (append-only writes need owner write)
 
-Permissions are enforced using chmod and verified on every vault operation.
+Vault rewrites use a chmod-0o600 → write → chmod-0o400 dance. The file is never world-readable or world-writable at any point. See `security.set_vault_file_permissions`, `security.make_vault_writable`, and `vault.VaultManager._persist_vault`.
 
 **Application-Level Verification**
 
@@ -92,9 +92,15 @@ The application implements several runtime controls to prevent unauthorized acce
 
 **Master Key Management**
 
-The master key derived from the master password is stored in a bytearray (not a string). This allows the application to overwrite the key with zeros when the vault is locked, removing the key from memory.
+The derived 32-byte master key is never persisted on the VaultManager instance. Every operation that needs the key calls `_get_derived_key()`, uses the key inside a `try / finally` block, and wipes it with `wipe_key()` before returning. `wipe_key` releases the OS memory lock (see below) and zero-fills the bytearray.
 
-When the vault is locked either manually or through auto-lock, the master key is explicitly zero-filled to prevent recovery from memory dumps. The vault_data is also set to None.
+The master password (the user-supplied string) lives on the instance for the duration of the session so the key can be re-derived per call. `lock_vault()`, `clear_sensitive_data()`, and the auto-lock path all zero-fill the password bytes, drop the salt, and set `vault_data` and the decrypted metadata plaintext to `None`.
+
+**mlock / VirtualLock on Derived Key Buffers**
+
+`_get_derived_key()` returns a `bytearray` that has been passed through `security.try_lock_memory()`. On POSIX this calls `libc.mlock()` on the key buffer; on Windows it calls `VirtualLock()` through `ctypes`. The goal is to keep a derived key out of swap for the microseconds it is in RAM.
+
+Memory locking is best-effort. Unprivileged users have a small `RLIMIT_MEMLOCK` budget on Linux, and a working set limit on Windows. On failure the helper returns `False`, writes a single `MEMORY_LOCK_UNAVAILABLE` audit event, and the caller proceeds. Key wipes still run. This is documented as a honest, partial mitigation, not a complete defence against an administrator-privileged attacker with a process memory dump.
 
 **Auto-Lock on Inactivity**
 
@@ -148,9 +154,21 @@ This vault integrity hash is stored in the vault file. On load, if the vault met
 
 This detects if entries have been added, deleted, or reordered.
 
-**Validation Token**
+**Encrypted Metadata Block (Validation Token + Timestamps)**
 
-Each vault stores a top-level `validation_token` field. This is a short known plaintext (`password_manager:v3.0:valid`) encrypted with the derived master key and protected by HMAC-SHA256. On load, the token is decrypted and compared against the expected plaintext. A wrong master password fails at this check before any user entry is touched. The token lives at the top level of the vault document, not inside `entries`, so entry iteration does not need special-case filtering.
+Each v3.1 vault stores an `encrypted_metadata` field at the top level. This is a single AES-256-GCM blob that decrypts to a JSON document of the form:
+
+```
+{
+  "validation_token": "password_manager:v3.1:valid",
+  "created": "<ISO-8601>",
+  "modified": "<ISO-8601>"
+}
+```
+
+On load, the block is decrypted with the derived master key. If the decryption or the `validation_token` comparison fails, a wrong-password error is raised before any user entry is touched. On write, the block is re-encrypted with a fresh nonce, with `modified` bumped to `now()`.
+
+Moving the timestamps inside this block closes the Phase-2 "timestamp leakage" finding. An attacker with only read access to the vault file can no longer see when the vault was created or last modified without the master password.
 
 ### Anti-Brute Force Protection
 
@@ -356,9 +374,9 @@ This two-layer approach ensures:
 
 **Backup Format Versions**
 
-- Version 3.1 is the only accepted format. The outer envelope is tagged `3.1`, its inner `export_data` is tagged `3.0`.
+- Version 3.2 is the only accepted backup format. The outer envelope is tagged `3.2` and carries `kdf`, `file_nonce`, `file_ciphertext`, and `file_salt`. Its inner `export_data` (once file-layer decryption succeeds) is tagged `3.1` and matches the current vault schema.
 
-Earlier formats (1.0, 2.0, 2.1) are rejected on import with a clear error. There was no real data under the old formats, so no migration path is provided.
+Earlier formats (1.0, 2.0, 2.1, and the Phase-1 `3.1` outer / `3.0` inner pairing) are rejected on import with a clear error. There was no real data under the old formats, so no migration path is provided.
 
 **Import Function**
 
@@ -402,128 +420,60 @@ The import process verifies HMAC on all encrypted data, protecting against tampe
 
 ---
 
-## Security Weaknesses and Remediation Plans
+## Vulnerability Report Remediation Status
 
-### Current Weaknesses
+This section tracks the findings from `Vulnerability_Assessment_November_21_2025.md` and the Phase-0 agent audit against their current code state. Each item is marked **Resolved**, **Partially mitigated**, or **Accepted risk**, with a code reference.
 
-**1. Master Key in Memory**
+### Critical
 
-Current state: When a vault is loaded, the master key is stored in a bytearray in RAM. While it is zero-filled when the vault locks, it remains in memory during the entire session.
+**C1. Master key resident in RAM for the whole session.** — **Resolved.**
+The VaultManager no longer caches a derived key. Every operation re-derives via `_get_derived_key()` (`vault.py:208`) and wipes the bytearray with `wipe_key()` (`security.py`) in a `finally` block. See `vault.add_entry`, `vault.get_entry`, `vault.delete_entry`, `vault._add_entry_direct`, `vault.add_entry_from_import`, `vault.export_vault`, `vault.import_vault`, `vault.decrypt_backup_entries`. The key is held for microseconds per call.
 
-Weakness: If an attacker gains access to the system while the vault is loaded, they could potentially extract the master key from memory using memory forensics tools or a live system compromise.
+### High
 
-Remediation plan (Phase 2):
-- Implement DPAPI (Windows Data Protection API) to encrypt the master key using OS-level encryption
-- Use mlock() on Unix systems to prevent the master key from being swapped to disk
-- Implement periodic key re-derivation and rotation
-- Add support for hardware security modules (HSM) for key storage
+**H1. Swap paging can flush the in-memory key to disk.** — **Partially mitigated.**
+`security.try_lock_memory()` wraps `libc.mlock()` on POSIX and `kernel32.VirtualLock()` on Windows, and is called on every derived-key bytearray before it is returned from `_get_derived_key()`. Unprivileged mlock budgets are small on Linux (`RLIMIT_MEMLOCK`), and the lock may silently fail. Failures emit a single `MEMORY_LOCK_UNAVAILABLE` audit event and the caller continues. The key is still zero-filled in every case.
 
-**2. Side-Channel Attacks**
+**H2. Admin-privileged process dump.** — **Accepted risk.**
+A process running as root (POSIX) or with `SeDebugPrivilege` (Windows) can still read live process memory and extract the derived key during the microseconds it is live, or read the master password bytes that live on the instance. This is an inherent limit of a userspace password manager without an HSM or DPAPI integration. Documented honestly rather than hidden.
 
-Current state: While HMAC comparison uses constant-time comparison, the KDF computation time varies based on system load. Master password validation takes approximately 2 seconds on modern systems.
+**H3. Vault files created 0o600; should be 0o400 at rest.** — **Resolved.**
+`set_vault_file_permissions()` (`security.py`) now sets `0o400` on POSIX and an owner-R-only ACL on Windows. `_persist_vault()` (`vault.py`) relaxes to 0o600 only for the duration of the rewrite. `set_readonly_permissions()` for backups also now writes 0o400 instead of 0o444.
 
-Weakness: An attacker could potentially measure the time taken for key derivation to gain information about system capabilities. The current KDF parameters are designed for modern systems and may not perform well on older systems.
+**H4. PBKDF2 at 100k iterations is below OWASP 2023 minimum.** — **Resolved in Phase 1.** Argon2id is the default KDF (OWASP 2023 params: t=2, m=19456 KiB, p=1). PBKDF2-HMAC-SHA256 fallback is 310,000 iterations — only reached if `argon2-cffi` is not importable. Each vault records its KDF in `metadata.kdf`.
 
-Remediation plan (Phase 2):
-- Implement additional side-channel protections
-- Add hardware security module support to offload KDF computation
-- Implement time-sliced operations that always take a fixed time regardless of password
-- Add protection against power analysis attacks (for hardware implementation)
+### Medium
 
-**3. Clipboard Implementation**
+**M1. Backup metadata timestamps stored unencrypted at the top level.** — **Resolved.**
+Vault-level `created` and `modified` have been moved into the `encrypted_metadata` block (v3.1 vault format). The on-disk JSON has no plaintext timestamps; see `tests/test_phase2_hardening.py::TestEncryptedTimestamps`. Backup envelopes already had no top-level timestamps (the inner `export_data` is encrypted under both the content key and the file key).
 
-Current state: Clipboard auto-clear uses a background thread with a 15-second timeout. The clipboard implementation uses pyperclip which may not work on all systems.
+**M2. `pycryptodome` listed in requirements but never imported.** — **Resolved.**
+Dropped from `requirements.txt`. The test suite and end-to-end smoke verified the application runs without it.
 
-Weakness: If the user minimizes the application or if the clipboard manager interferes, the auto-clear may not function reliably. Some clipboard managers cache data indefinitely.
+**M3. `subprocess.run(..., shell=True)` in three icacls calls.** — **Resolved.**
+`security._run_icacls()` builds a list-form argv and calls `subprocess.run(args, shell=False, ...)`. `_set_file_permissions`, `set_vault_file_permissions`, `make_vault_writable`, `set_readonly_permissions`, and `set_secure_dir_permissions` all route through it. The classic command-injection surface against an attacker-controlled path is closed.
 
-Remediation plan (Phase 1):
-- Add system-specific clipboard clearing (Windows: WinAPI, Unix: xclip/xsel)
-- Implement periodic clipboard monitoring instead of just timeout-based clearing
-- Allow user configuration of clipboard timeout
-- Add clipboard protection mode that prevents external clipboard access
+### KDF Documentation vs Code
 
-**4. File Permissions Not Always Enforced**
+**K1. Docs advertised Argon2id but code always called PBKDF2@100k.** — **Resolved in Phase 1.** `argon2-cffi` is now actually invoked (`_derive_key_argon2id`). Docs are rewritten to match code. Unit tests assert Argon2id is called, PBKDF2 fallback is only reached when patched off, and `metadata.kdf` reflects reality.
 
-Current state: File permissions are set during vault creation and on every save. However, permissions are not continuously monitored.
+### Other Notable Weaknesses
 
-Weakness: If a user or administrator changes file permissions after vault creation, the vault will still load and function. This represents a security issue if permissions are modified to grant access to other users.
+**N1. Clipboard reliability.** — Accepted as known limit of desktop clipboard APIs. Auto-clear after 15s via background thread. Revisit in Phase 6 (scalability / portability).
 
-Remediation plan (Phase 2):
-- Add permission verification on every vault load
-- Refuse to load vault if permissions are incorrect
-- Add warning in GUI if permissions are not as expected
-- Implement file integrity monitoring (FIM)
+**N2. File permissions are not continuously verified on load.** — Accepted for now. If a privileged user tampered with the ACL, the vault still loads. Out of scope for Phase 2; reconsider if Phase 6 adds file integrity monitoring.
 
-**5. No Master Password Change Functionality**
+**N3. No master-password change.** — Accepted for Phase 2. Listed in the agent-audit backlog for Phase 4.
 
-Current state: Once a vault is created with a master password, there is no way to change the master password.
+**N4. Audit log not encrypted.** — Accepted. Deferred to a later phase.
 
-Weakness: If the master password is compromised, the user cannot re-secure the vault without exporting and recreating it.
+**N5. No 2FA / hardware key support.** — Accepted. Out of scope for a single-user desktop tool.
 
-Remediation plan (Phase 1):
-- Implement master password change feature
-- This would require re-deriving all entry keys and re-encrypting all entries
-- Audit log the password change event
+**N6. Rate-limit params are fixed.** — Accepted. Sufficient for single-user local use.
 
-**6. Audit Log Not Encrypted**
+**N7. No secure deletion / SSD TRIM.** — Accepted. Out of scope; the vault is encrypted-at-rest, which limits the practical value of secure deletion.
 
-Current state: The audit log is stored in plaintext with restricted file permissions but is not encrypted.
-
-Weakness: If an attacker gains read access to the audit log, they can see a history of operations performed.
-
-Remediation plan (Phase 3):
-- Implement encrypted audit logs
-- Use separate encryption key for audit log (stored securely)
-- Allow archival of audit logs to external secure storage
-- Implement audit log signing for non-repudiation
-
-**7. No Two-Factor Authentication**
-
-Current state: Vault access is controlled solely by the master password.
-
-Weakness: If the master password is compromised or brute forced, the vault is accessible to the attacker. No second factor is required.
-
-Remediation plan (Phase 2):
-- Add optional TOTP-based two-factor authentication
-- Add hardware security key support
-- Implement time-based one-time passwords
-- Add recovery codes for account recovery
-
-**8. Limited Rate Limiting Options**
-
-Current state: Rate limiting is fixed at 5 attempts with exponential backoff.
-
-Weakness: An attacker with computational resources might still perform distributed attacks from multiple systems. The exponential backoff eventually caps out and could be circumvented with patience.
-
-Remediation plan (Phase 2):
-- Make rate limiting parameters configurable
-- Implement adaptive rate limiting based on failed patterns
-- Add IP-based rate limiting for network access (future web version)
-- Implement machine learning detection of brute force patterns
-
-**9. No Secure Deletion**
-
-Current state: When a user deletes an entry, it is removed from the vault file but may leave traces on disk.
-
-Weakness: If the vault file is deleted or entries are overwritten, the old data may be recoverable using disk forensics tools.
-
-Remediation plan (Phase 3):
-- Implement secure deletion using cryptographic erasure
-- Use multi-pass overwriting for deleted entries
-- Implement TRIM support for SSDs
-- Add option for encrypted temporary files
-
-**10. No Multi-Device Synchronization**
-
-Current state: Vaults are stored locally on a single device.
-
-Weakness: Users cannot access the same vault from multiple devices. They must manually export and import to synchronize.
-
-Remediation plan (Phase 3):
-- Implement cloud synchronization with end-to-end encryption
-- Synchronize vaults across devices while maintaining end-to-end encryption
-- Implement conflict resolution for concurrent edits
-- Implement offline-first synchronization
+**N8. No multi-device sync.** — Not a weakness in the threat model; local-first is a feature.
 
 ---
 
@@ -655,8 +605,8 @@ Current Status: Production-ready for local use with strong cryptographic foundat
 
 ---
 
-Document Version: 2.0
-Last Updated: November 19, 2025
+Document Version: 3.0
+Last Updated: 2026-04-19 (Phase 2 security remediation)
 Review Schedule: Quarterly security audits recommended
 
 

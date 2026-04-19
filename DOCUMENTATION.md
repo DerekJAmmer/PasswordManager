@@ -69,7 +69,6 @@ Required packages:
 - cryptography (version 41.0.0+): Encryption library
 - argon2-cffi (version 21.3.0+): Password hashing
 - pyperclip (version 1.8.2+): Clipboard management
-- pycryptodome (version 3.18.0+): Additional cryptographic utilities
 
 ### Step 3: Verify Installation
 
@@ -304,7 +303,7 @@ This dual-layer approach ensures:
 
 **Backup Formats**
 
-Only one backup format is supported: version 3.1. The outer envelope is tagged `3.1` and wraps an inner `export_data` tagged `3.0`. Both layers carry their own KDF metadata so decryption uses the exact parameters from export, never a guess.
+Only one backup format is supported: version 3.2. The outer envelope is tagged `3.2` and wraps an inner `export_data` tagged `3.1`. Both layers carry their own KDF metadata so decryption uses the exact parameters from export, never a guess.
 
 Older formats (1.0, 2.0, 2.1) are rejected on import with a clear error. There is no migration path because no real user data was created under the old formats.
 
@@ -332,9 +331,9 @@ python vault.py import backup.json
 **Import Process**
 
 When importing a backup:
-1. The backup version is checked. Anything other than `3.1` is rejected.
+1. The backup version is checked. Anything other than `3.2` is rejected.
 2. The KDF metadata on the outer envelope is used to derive the file-level key. The outer ciphertext is decrypted and HMAC verified. Wrong password fails here without exposing inner contents.
-3. The inner `export_data` is parsed. Its version must be `3.0`. Its own KDF metadata is used to derive the content-level key for per-entry decryption.
+3. The inner `export_data` is parsed. Its version must be `3.1`. Its own KDF metadata is used to derive the content-level key for per-entry decryption.
 4. Each entry is decrypted, HMAC verified, and added to the new vault under the new vault's master key.
 
 If any integrity check fails, the import is aborted and an error is reported.
@@ -489,8 +488,8 @@ The application configuration is stored in `config.py`. Key settings include:
 - SALT_LENGTH: 16 bytes
 - NONCE_LENGTH: 12 bytes (GCM nonce)
 - KEY_LENGTH: 32 bytes (AES-256)
-- VAULT_FORMAT_VERSION: "3.0"
-- BACKUP_FORMAT_VERSION: "3.1"
+- VAULT_FORMAT_VERSION: "3.1"
+- BACKUP_FORMAT_VERSION: "3.2"
 
 **Security Policies:**
 - MIN_PASSWORD_LENGTH: 12 characters minimum
@@ -530,13 +529,11 @@ Vault files are stored in JSON format with the following structure:
 
 ```
 {
-  "version": "3.0",
-  "created": "2026-04-16T12:34:56Z",
-  "modified": "2026-04-16T12:34:56Z",
+  "version": "3.1",
   "salt": "base64_encoded_salt_value",
-  "validation_token": {
+  "encrypted_metadata": {
     "nonce": "base64_encoded_nonce",
-    "ciphertext": "base64_encoded_encrypted_token",
+    "ciphertext": "base64_encoded_encrypted_metadata",
     "hmac": "base64_encoded_hmac_tag"
   },
   "entries": {
@@ -562,25 +559,24 @@ Vault files are stored in JSON format with the following structure:
 ```
 
 **Field Descriptions:**
-- version: Vault format version. Current is `3.0`. Earlier versions are rejected on load.
-- created, modified: ISO 8601 timestamps.
+- version: Vault format version. Current is `3.1`. Earlier versions are rejected on load.
 - salt: 16-byte random value used by the KDF. Base64 encoded.
-- validation_token: A known plaintext encrypted with the derived master key. Used to detect a wrong master password at load time without touching user entries.
+- encrypted_metadata: AES-256-GCM ciphertext of a small JSON blob `{"validation_token", "created", "modified"}`. Decrypting it serves two jobs at once: it verifies the master password (known-plaintext validation token) and recovers the created/modified timestamps. Nothing at the top level leaks when the vault was created or last touched.
 - entries: Dictionary of encrypted password entries. Each entry has its own nonce, ciphertext, and HMAC-SHA256 tag computed over nonce + ciphertext.
 - metadata.kdf: The exact KDF parameters used for this vault. Either `{"name": "Argon2id", "time_cost", "memory_cost", "parallelism"}` or `{"name": "PBKDF2-HMAC-SHA256", "iterations"}`. This field is the source of truth at load time.
 - metadata.encryption, metadata.integrity_protection: Descriptive strings. The code does not read them for dispatch.
 - integrity_hash: SHA-256 over sorted `name:nonce:ciphertext` tuples of all entries. Detects add, delete, or reorder without touching ciphertext.
 
-Backup files follow the same entry layout but wrap it in an outer envelope tagged `3.1` with its own `file_salt`, `file_nonce`, `file_ciphertext`, `file_hmac`, and `kdf` field. The decrypted payload is an inner object tagged `3.0` that carries its own content-level salt, `_content_kdf`, and the encrypted entries dictionary.
+Backup files follow the same entry layout but wrap it in an outer envelope tagged `3.2` with its own `file_salt`, `file_nonce`, `file_ciphertext`, `file_hmac`, and `kdf` field. The decrypted payload is an inner object tagged `3.1` that carries its own content-level salt, `_content_kdf`, and the encrypted entries dictionary.
 
 ### File Permissions
 
 Vault files are automatically protected with restrictive permissions:
 
-- Unix/Linux: 600 (read/write for owner only)
-- Windows: ACL with full access for owner only
+- Unix/Linux: 400 at rest (owner read-only). The vault is briefly relaxed to 600 for writes, then tightened back to 400.
+- Windows: ACL trimmed to owner Read-only (R) via `icacls`. Writes temporarily grant owner Modify (M), then tighten back to R.
 
-These permissions ensure only the vault owner can read the vault file.
+These permissions ensure only the vault owner can read the vault file and that casual tooling cannot overwrite it without going through the vault code path.
 
 ### Audit Log
 
